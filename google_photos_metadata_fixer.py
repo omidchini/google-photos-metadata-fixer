@@ -39,7 +39,7 @@ if WINDOWS:
         import win32file
         import win32con
     except ImportError:
-        print('\n[ERROR] pywin32 is required for setting creation time on Windows.\nRun: pip install pywin32\n')
+        print('\n[ERROR] pywint32 is required for setting creation time on Windows.\nRun: pip install pywin32\n')
         sys.exit(1)
 
 def set_file_creation_time(path, timestamp):
@@ -60,12 +60,20 @@ def set_file_creation_time(path, timestamp):
 def set_exif_jpeg(file_path, json_data, people):
     try:
         img = Image.open(file_path)
-        exif_dict = {"0th":{}, "Exif":{}, "GPS":{}, "1st":{}, "thumbnail":None}
+        exif_bytes = img.info.get('exif')
+        if exif_bytes:
+            exif_dict = piexif.load(exif_bytes)
+        else:
+            exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
+
+        # Update DateTimeOriginal if present in JSON
         try:
             dt = datetime.datetime.utcfromtimestamp(int(json_data['photoTakenTime']['timestamp']))
             exif_dict['Exif'][piexif.ExifIFD.DateTimeOriginal] = dt.strftime("%Y:%m:%d %H:%M:%S")
         except Exception:
             pass
+
+        # Update GPS if present in JSON
         gps = json_data.get('geoData') or {}
         if gps.get('latitude') and gps.get('longitude'):
             try:
@@ -78,131 +86,29 @@ def set_exif_jpeg(file_path, json_data, people):
                     exif_dict['GPS'][piexif.GPSIFD.GPSAltitude] = (int(abs(gps['altitude'] * 100)), 100)
             except Exception:
                 pass
+
+        # Add XPKeywords if any people
         if people:
             try:
                 keywords = ";".join(people).encode('utf-16le')
                 exif_dict['0th'][piexif.ImageIFD.XPKeywords] = keywords
             except Exception:
                 pass
-        try:
-            exif_bytes = piexif.dump(exif_dict)
-            img.save(file_path, "jpeg", exif=exif_bytes)
-            return True
-        except Exception:
-            return False
-    except Exception:
+
+        exif_bytes = piexif.dump(exif_dict)
+        img.save(file_path, "jpeg", exif=exif_bytes)
+        return True
+    except Exception as e:
+        print(f"[EXIF ERROR] {file_path}: {e}")
         return False
 
-def extract_main_media_name_and_index(filename):
-    base = os.path.basename(filename)
-    name, _ = os.path.splitext(base)
-    m = re.search(r'\((\d+)\)$', name)
-    index = m.group(1) if m else ''
-    name = re.sub(r'\(\d+\)$', '', name)
-    name = re.sub(r'([_-]edited.*)$', '', name, flags=re.I)
-    name = name.rstrip(' _-')
-    return name.lower(), index
-
-def build_json_lookup(all_json_files):
-    lookup = {}
-    for json_path in all_json_files:
-        json_base = os.path.basename(json_path).lower()
-        json_base_noext = json_base[:-5] if json_base.endswith('.json') else json_base
-        m = re.search(r'\((\d+)\)$', json_base_noext)
-        index = m.group(1) if m else ''
-        base = re.sub(r'\(\d+\)$', '', json_base_noext)
-        base = re.sub(r'([_-]edited.*)$', '', base, flags=re.I)
-        base = base.rstrip(' _-')
-        fullkey = base
-        indexkey = f"{base}({index})" if index else None
-        for key in filter(None, [fullkey, indexkey]):
-            lookup.setdefault(key, []).append((json_base_noext, json_path))
-    return lookup
-
-def find_json_for_media(media_filename, json_lookup):
-    base_name = os.path.basename(media_filename).lower()
-    main_part, index = extract_main_media_name_and_index(media_filename)
-    key_with_index = f"{main_part}({index})" if index else None
-    key_plain = main_part
-
-    # 1. Exact match: JSON whose base starts with the full media filename (including extension)
-    candidates = []
-    for key, entries in json_lookup.items():
-        for jb, jp in entries:
-            if jb.startswith(base_name):
-                candidates.append((jb, jp))
-    if candidates:
-        unindexed = []
-        indexed = []
-        for jb, jp in candidates:
-            if re.search(r'\(\d+\)$', jb):
-                indexed.append((len(jb[len(base_name):]), jb[len(base_name):], jp))
-            else:
-                unindexed.append((len(jb[len(base_name):]), jb[len(base_name):], jp))
-        if unindexed:
-            unindexed.sort()
-            return unindexed[0][2]
-        elif indexed:
-            indexed.sort()
-            return indexed[0][2]
-
-    # 2. If indexed, only allow indexed matches (as before)
-    if index and key_with_index in json_lookup:
-        candidates = json_lookup[key_with_index]
-        suffix_candidates = [(len(jb[len(main_part):]), jb[len(main_part):], jp)
-                             for jb, jp in candidates if jb.startswith(main_part)]
-        if suffix_candidates:
-            suffix_candidates.sort()
-            return suffix_candidates[0][2]
-
-    # 3. If not indexed, prefer non-indexed JSONs over indexed (as before)
-    if not index and key_plain in json_lookup:
-        candidates = json_lookup[key_plain]
-        unindexed = []
-        indexed = []
-        for jb, jp in candidates:
-            if re.search(r'\(\d+\)$', jb):
-                indexed.append((len(jb[len(main_part):]), jb[len(main_part):], jp))
-            else:
-                unindexed.append((len(jb[len(main_part):]), jb[len(main_part):], jp))
-        if unindexed:
-            unindexed.sort()
-            return unindexed[0][2]
-        elif indexed:
-            indexed.sort()
-            return indexed[0][2]
-
-    # 4. Fallback: Try matching by best prefix (hash case)
-    media_name_noext, _ = os.path.splitext(base_name)
-    best_prefix = None
-    best_json = None
-    best_len = 0
-    for key, entries in json_lookup.items():
-        for jb, jp in entries:
-            jb_noext = jb
-            if jb_noext.endswith('.supplemental-metadata'):
-                jb_noext = jb_noext[:-len('.supplemental-metadata')]
-            if jb_noext.endswith('.supplemental-metadata(1)'):
-                jb_noext = jb_noext[:-len('.supplemental-metadata(1)')]
-            jb_noext, _ = os.path.splitext(jb_noext)
-            if media_name_noext.startswith(jb_noext) and len(jb_noext) >= 12:
-                if len(jb_noext) > best_len:
-                    best_prefix = jb_noext
-                    best_json = jp
-                    best_len = len(jb_noext)
-    if best_json:
-        return best_json
-
-    # 5. fallback: substring match anywhere
-    for key, entries in json_lookup.items():
-        for jb, jp in entries:
-            if main_part and main_part in jb:
-                return jp
-    for key, entries in json_lookup.items():
-        for jb, jp in entries:
-            if main_part and re.sub(r'[^a-z0-9]', '', main_part) in re.sub(r'[^a-z0-9]', '', jb):
-                return jp
-    return None
+def gather_files_flat(folder, ext_list):
+    files = []
+    for root, dirs, fls in os.walk(folder):
+        for f in fls:
+            if ext_list is None or f.lower().endswith(ext_list):
+                files.append(os.path.join(root, f))
+    return files
 
 def unzip_takeout_zips(source_folder, temp_folder):
     zip_files = glob.glob(os.path.join(source_folder, "takeout-*.zip"))
@@ -214,51 +120,147 @@ def unzip_takeout_zips(source_folder, temp_folder):
     for i, zip_file in enumerate(zip_files):
         print_bar(i+1, len(zip_files))
         with zipfile.ZipFile(zip_file, "r") as z:
-            # Extract all files flat into temp_folder
             for member in z.infolist():
                 if member.is_dir():
                     continue
-                # Remove any leading directories
                 out_name = os.path.basename(member.filename)
-                # If a file with the same name exists, add a unique suffix
-                out_path = os.path.join(temp_folder, out_name)
+                out_path = os.path.join(temp_flat_folder, out_name)
                 suffix = 1
                 while os.path.exists(out_path):
                     parts = os.path.splitext(out_name)
-                    out_path = os.path.join(temp_folder, f"{parts[0]}_{suffix}{parts[1]}")
+                    out_path = os.path.join(temp_flat_folder, f"{parts[0]}_{suffix}{parts[1]}")
                     suffix += 1
                 with z.open(member) as fsrc, open(out_path, "wb") as fdst:
                     shutil.copyfileobj(fsrc, fdst)
     print()
     return True
 
-def gather_files_flat(folder, ext_list):
-    files = []
-    for root, dirs, fls in os.walk(folder):
-        for f in fls:
-            if ext_list is None or f.lower().endswith(ext_list):
-                files.append(os.path.join(root, f))
-    return files
+def parse_indices(s):
+    """Remove trailing (N) indices from a string and return (base, [indices])."""
+    indices = []
+    while True:
+        m = re.search(r'\((\d+)\)$', s)
+        if not m:
+            break
+        indices.insert(0, int(m.group(1)))
+        s = s[:m.start()]
+    return s, indices
+
+def parse_json_core_indices(json_filename):
+    """
+    Extract the base, indices, and ext from a Takeout JSON.
+    Handles any number of dots in the base.
+    """
+    SUPPORTED_EXTS = ('.jpg', '.jpeg', '.png', '.gif', '.mp4', '.mov', '.avi', '.mkv', '.heic', '.webp', '.mpg')
+    base = os.path.basename(json_filename)
+    if not base.lower().endswith('.json'):
+        return None, None, None
+    s = base[:-5]  # remove .json
+
+    # Find the *last* supported extension in the string
+    last_ext_pos = -1
+    ext_found = None
+    for ext in SUPPORTED_EXTS:
+        pos = s.lower().rfind(ext)
+        if pos > last_ext_pos:
+            last_ext_pos = pos
+            ext_found = ext
+    if ext_found is not None and last_ext_pos != -1:
+        core = s[:last_ext_pos]
+        after_ext = s[last_ext_pos + len(ext_found):]
+        core_base, indices1 = parse_indices(core)
+        indices2 = [int(i) for i in re.findall(r'\((\d+)\)', after_ext)]
+        indices = tuple(indices1 + indices2)
+        return core_base, indices, ext_found
+    else:
+        # fallback: no recognized extension found
+        core_base, indices = parse_indices(s)
+        return core_base, tuple(indices), None
+
+def build_media_lookup(all_media_files):
+    # {(core, indices, ext): path, ...}
+    lookup = {}
+    # Also: {(core, ext): [(indices, path), ...]}
+    loose_lookup = {}
+    for f in all_media_files:
+        base = os.path.basename(f)
+        root, ext = os.path.splitext(base)
+        core, indices = parse_indices(root)
+        k = (core, tuple(indices), ext.lower())
+        lookup[k] = f
+        # For loose match
+        k_loose = (core, ext.lower())
+        loose_lookup.setdefault(k_loose, []).append((tuple(indices), f))
+        # 1-char truncation for Takeout bug
+        if len(core) > 1:
+            k2 = (core[:-1], tuple(indices), ext.lower())
+            lookup[k2] = f
+            k2_loose = (core[:-1], ext.lower())
+            loose_lookup.setdefault(k2_loose, []).append((tuple(indices), f))
+    return lookup, loose_lookup
+
+def indices_set(indices):
+    return set(indices)
+
+def match_json_to_media(jsonf, strict_lookup, loose_lookup):
+    jb, jindices, jext = parse_json_core_indices(jsonf)
+    if jb is None:
+        return None
+
+    exts_to_try = [jext] if jext else ['.jpg', '.jpeg', '.png', '.gif', '.mp4', '.mov', '.avi', '.mkv', '.heic', '.webp', '.mpg']
+
+    # Pass 1: strict (core, indices, ext)
+    for ext in exts_to_try:
+        k = (jb, jindices, ext)
+        if k in strict_lookup:
+            return strict_lookup[k]
+    # Pass 1b: strict, 1-char truncation
+    for ext in exts_to_try:
+        if len(jb) > 1:
+            k = (jb[:-1], jindices, ext)
+            if k in strict_lookup:
+                return strict_lookup[k]
+    # Pass 2: loose, match on core/ext, and indices as sets (allow superset/subset)
+    for ext in exts_to_try:
+        k_loose = (jb, ext)
+        if k_loose in loose_lookup:
+            for mindices, f in loose_lookup[k_loose]:
+                if not jindices or not mindices:
+                    return f
+                if indices_set(jindices) == indices_set(mindices):
+                    return f
+                if indices_set(jindices).issubset(indices_set(mindices)) or indices_set(mindices).issubset(indices_set(jindices)):
+                    return f
+    # Pass 2b: loose, 1-char truncation
+    for ext in exts_to_try:
+        if len(jb) > 1:
+            k_loose = (jb[:-1], ext)
+            if k_loose in loose_lookup:
+                for mindices, f in loose_lookup[k_loose]:
+                    if not jindices or not mindices:
+                        return f
+                    if indices_set(jindices) == indices_set(mindices):
+                        return f
+                    if indices_set(jindices).issubset(indices_set(mindices)) or indices_set(mindices).issubset(indices_set(jindices)):
+                        return f
+    return None
 
 def main():
-    # Set up folders and output
     source_folder = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser('~/Downloads')
-    output_folder = os.path.join(source_folder, f'Output-{datetime.datetime.now().strftime("%Y%m%dT%H%M%S")}')
+    output_folder = os.path.join(os.getcwd(), f'Output-{datetime.datetime.now().strftime("%Y%m%dT%H%M%S")}')
     temp_flat_folder = os.path.join(output_folder, "TEMP_FLAT")
     os.makedirs(output_folder, exist_ok=True)
 
-    # Step 1: Unzip Takeout if necessary
     unzipped = unzip_takeout_zips(source_folder, temp_flat_folder)
-    if unzipped:
-        scan_folder = temp_flat_folder
-    else:
-        scan_folder = source_folder
+    scan_folder = temp_flat_folder if unzipped else source_folder
 
-    # Step 2: Gather files
     media_exts = ('.jpg', '.jpeg', '.png', '.gif', '.mp4', '.mov', '.avi', '.mkv', '.heic', '.webp', '.mpg')
     all_files = gather_files_flat(scan_folder, None)
     all_json_files = [f for f in all_files if f.lower().endswith('.json')]
-    all_media_files = [f for f in all_files if f.lower().endswith(media_exts)]
+    all_media_files = [
+        f for f in all_files
+        if f.lower().endswith(media_exts) and not re.search(r'(-edited|-edit|-crop)', os.path.basename(f), re.IGNORECASE)
+    ]
 
     if not all_media_files:
         print("[ERROR] No media files found to process.")
@@ -267,28 +269,30 @@ def main():
     log(f"[INFO] Found {len(all_media_files)} media files and {len(all_json_files)} JSONs.")
 
     already_processed = set(os.listdir(output_folder))
+
+    log("[INFO] Building media lookup for robust JSON-to-media matching...")
+    strict_lookup, loose_lookup = build_media_lookup(all_media_files)
+
     valid_pairs = []
-    unmatched_media = []
-    matched_jsons = set()
+    unmatched_jsons = []
+    matched_media = set()
 
-    log("[INFO] Building JSON lookup for fast matching...")
-    json_lookup = build_json_lookup(all_json_files)
-
-    log("[INFO] Matching media to JSONs (with extension and hash-aware matching)...")
-    for i, fl in enumerate(all_media_files):
-        print_bar(i + 1, len(all_media_files))
-        base_name = os.path.basename(fl)
+    log("[INFO] Matching JSONs to media files (robust Takeout normalization)...")
+    for i, jsonf in enumerate(all_json_files):
+        print_bar(i + 1, len(all_json_files))
+        base_name = os.path.basename(jsonf)
         if base_name in already_processed:
             continue
-        match = find_json_for_media(fl, json_lookup)
-        if match:
-            valid_pairs.append((fl, match))
-            matched_jsons.add(match)
+        found = match_json_to_media(jsonf, strict_lookup, loose_lookup)
+        if found and found not in matched_media:
+            valid_pairs.append((found, jsonf))
+            matched_media.add(found)
         else:
-            unmatched_media.append(fl)
+            unmatched_jsons.append(jsonf)
     print()
+    log(f"[INFO] Starting move and EXIF loop for {len(valid_pairs)} pairs")
 
-    unmatched_jsons = [jsonf for jsonf in all_json_files if jsonf not in matched_jsons]
+    unmatched_media = [mediaf for mediaf in all_media_files if mediaf not in matched_media]
 
     unmatched_media_path = os.path.join(output_folder, 'unmatched_media.txt')
     with open(unmatched_media_path, 'w', encoding='utf-8') as f:
@@ -302,23 +306,33 @@ def main():
             f.write(item + '\n')
     log(f"[INFO] Wrote unmatched JSON list: {unmatched_jsons_path}")
 
-    log(f"[INFO] Matched {len(valid_pairs)} media files with JSON. {len(unmatched_media)} unmatched media files. {len(unmatched_jsons)} unmatched JSONs.")
+    matched_pairs_path = os.path.join(output_folder, 'matched_pairs.txt')
+    with open(matched_pairs_path, 'w', encoding='utf-8') as f:
+        for media, jsonf in valid_pairs:
+            f.write(f"{media}\t{jsonf}\n")
+    log(f"[INFO] Wrote matched pairs list: {matched_pairs_path}")
 
-    log("[INFO] Copying files and applying metadata...")
+    log(f"[INFO] Matched {len(valid_pairs)} JSON files with media. {len(unmatched_media)} unmatched media files. {len(unmatched_jsons)} unmatched JSONs.")
+
+    # ==== Uncomment the following block to perform move/EXIF operations ====
+    
+    log("[INFO] Moving files and applying metadata...")
     for i, (media, jsonf) in enumerate(valid_pairs):
         print_bar(i + 1, len(valid_pairs))
         dest_name = os.path.basename(media)
         dest_path = os.path.join(output_folder, dest_name)
-        shutil.copy2(media, dest_path)
         json_dest_name = os.path.basename(jsonf)
         json_dest_path = os.path.join(output_folder, json_dest_name)
-        shutil.copy2(jsonf, json_dest_path)
+
+        # Move files (not copy)
+        shutil.move(media, dest_path)
+        shutil.move(jsonf, json_dest_path)
         meta = None
         try:
-            with open(jsonf, encoding='utf-8') as jf:
+            with open(json_dest_path, encoding='utf-8') as jf:
                 meta = json.load(jf)
         except Exception as e:
-            log(f"[ERROR] Could not parse JSON: {jsonf} (skipping file: {media}) - {e}")
+            log(f"[ERROR] Could not parse JSON: {json_dest_path} (skipping file: {dest_path}) - {e}")
             continue
 
         people = []
@@ -327,7 +341,8 @@ def main():
 
         exif_result = None
         if dest_name.lower().endswith(('.jpg', '.jpeg')):
-            exif_result = set_exif_jpeg(dest_path, meta, people)
+            exif_result = "Skipped EXIF for JPEG"  # No EXIF for JPEGs in this script
+            #exif_result = set_exif_jpeg(dest_path, meta, people)
         elif dest_name.lower().endswith(('.mp4', '.mov', '.avi', '.mkv', '.mpg')):
             exif_result = f"People: {people}" if people else "No EXIF, but timestamp set"
         else:
@@ -339,24 +354,26 @@ def main():
         if ts:
             os.utime(dest_path, (ts, ts))
             set_file_creation_time(dest_path, ts)
+            os.utime(json_dest_path, (ts, ts))
+            set_file_creation_time(json_dest_path, ts)
         else:
             log(f"    [WARN] No usable timestamp in JSON for: {dest_name}")
 
         log(f"[MATCH] MEDIA: {media} | JSON: {jsonf} | OUT: {dest_path} | People: {people if people else 'n/a'} | EXIF: {exif_result}")
 
+    log("[INFO] Finished move and EXIF loop.")
     print()
-
     if unmatched_media:
         failed_dir = os.path.join(output_folder, 'FAILED')
         os.makedirs(failed_dir, exist_ok=True)
-        log(f"[INFO] Copying {len(unmatched_media)} unmatched files to FAILED...")
+        log(f"[INFO] Moving {len(unmatched_media)} unmatched files to FAILED...")
         for i, media in enumerate(unmatched_media):
             print_bar(i + 1, len(unmatched_media))
             dest_failed = os.path.join(failed_dir, os.path.basename(media))
-            shutil.copy2(media, dest_failed)
+            shutil.move(media, dest_failed)
             log(f"[FAILED] MEDIA: {media} | Reason: No JSON match")
         print()
-
+    
     log_path = os.path.join(output_folder, 'process_log.txt')
     with open(log_path, 'w', encoding='utf-8') as f:
         for line in LOG_LINES:
@@ -375,7 +392,6 @@ def main():
     log(f"    Output in: {output_folder}")
     log(f"    Log written to: {log_path}")
 
-    # Cleanup temp folder
     if unzipped:
         shutil.rmtree(temp_flat_folder, ignore_errors=True)
 
